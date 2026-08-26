@@ -6,10 +6,12 @@ from simulation.scenario import get_scenario
 from simulation.simulator import PARAMS, VALID_LAND, simulate
 
 
+# Resource terms are tie-breakers, not a reason to stop cooling the city early.
+# Hard budget/water caps are enforced separately below.
 OBJECTIVES = {
-    "balanced": {"cost": 0.20, "water": 0.18, "cooling": 1.0},
-    "max_cooling": {"cost": 0.04, "water": 0.04, "cooling": 1.0},
-    "low_resource": {"cost": 0.48, "water": 0.40, "cooling": 1.0},
+    "balanced": {"cost": 0.010, "water": 0.005, "cooling": 1.0},
+    "max_cooling": {"cost": 0.0, "water": 0.0, "cooling": 1.0},
+    "low_resource": {"cost": 0.050, "water": 0.040, "cooling": 1.0},
 }
 
 
@@ -18,10 +20,15 @@ def _candidates(scenario_id: str):
     out = []
     for cell in scenario.cells:
         for kind in ("tree", "green", "water", "roof", "pavement"):
-            if cell.land in VALID_LAND[kind]:
-                stride = 2 if kind in ("tree", "roof", "pavement") else 3
-                if (cell.x + 2 * cell.y) % stride == 0:
-                    out.append({"type": kind, "x": cell.x, "y": cell.y})
+            if cell.land not in VALID_LAND[kind]:
+                continue
+
+            # Trees are kept at full spatial resolution because their exact
+            # placement is the central comparison against "plant at the hottest
+            # valid cells". Larger interventions are sampled more coarsely and
+            # then prefiltered by their measured single-action benefit.
+            if kind == "tree" or (cell.x + 2 * cell.y) % 2 == 0:
+                out.append({"type": kind, "x": cell.x, "y": cell.y})
     return out
 
 
@@ -50,13 +57,13 @@ def _prefilter(
     budget: float,
     water: float,
     weights: dict,
-    keep: int = 84,
+    keep: int = 96,
 ) -> list[dict]:
-    """Keep only promising single-action candidates before interaction search.
+    """Keep promising single-action candidates before interaction search.
 
-    This preserves counterfactual re-evaluation while making live optimization
-    fast enough for the judging demo. It is a search heuristic, not a claim of
-    optimality.
+    This is only a latency heuristic. The retained candidates are still
+    re-simulated after every accepted intervention so interactions are not
+    treated as independent or additive.
     """
     ranked = []
     for candidate in candidates:
@@ -89,32 +96,40 @@ def _greedy_profile(
     )
     plan: list[dict] = []
     history = []
-    previous_score = float("-inf")
+    current_exposure = baseline_exposure
 
     for iteration in range(max_items):
         spent, used_water = _resources(plan)
         occupied = {(i["x"], i["y"]) for i in plan}
         best = None
+
         for candidate in candidates:
             if (candidate["x"], candidate["y"]) in occupied:
                 continue
             p = PARAMS[candidate["type"]]
             if spent + p["cost"] > budget or used_water + p["water"] > water:
                 continue
+
             trial = plan + [candidate]
             result = simulate(interventions=trial, scenario_id=scenario_id)
+            candidate_exposure = result["metrics"]["exposure_index"]
+
+            # Never spend resources on an action that does not improve the
+            # person-weighted exposure objective in the current configuration.
+            if candidate_exposure >= current_exposure - 1e-6:
+                continue
+
             score = _score(baseline_exposure, result, budget, water, weights)
             if best is None or score > best[0]:
                 best = (score, candidate, result)
 
         if best is None:
             break
+
         score, candidate, result = best
-        if score <= previous_score + 1e-6:
-            break
-        previous_score = score
         plan.append(candidate)
         candidates.remove(candidate)
+        current_exposure = result["metrics"]["exposure_index"]
         history.append(
             {
                 "iteration": iteration + 1,
@@ -176,6 +191,6 @@ def optimize(
         "profiles": profiles,
         "search_note": (
             "Candidate-prefiltered constrained counterfactual greedy search with interaction "
-            "re-evaluation; not claimed as a global optimum."
+            "re-evaluation; hard resource caps enforced; not claimed as a global optimum."
         ),
     }
