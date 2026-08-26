@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import math
 from typing import Iterable
+
+import numpy as np
 
 from simulation.scenario import Scenario, get_scenario
 
@@ -27,23 +28,8 @@ def _index(x: int, y: int, width: int) -> int:
     return y * width + x
 
 
-def _kernel(distance: float, radius: float) -> float:
-    return math.exp(-((distance / max(radius, 0.01)) ** 2))
-
-
-def _blank(width: int, height: int, value: float = 0.0) -> list[list[float]]:
-    return [[value for _ in range(width)] for _ in range(height)]
-
-
-def _flatten(grid: list[list[float]]) -> list[float]:
-    return [v for row in grid for v in row]
-
-
 def _cell_baseline_temp(scenario: Scenario, idx: int) -> float:
     c = scenario.cells[idx]
-    # Reduced-order surface-energy proxy. Coefficients are intentionally explicit
-    # and should be calibrated against measured/simulated reference data before
-    # any real-world cooling claim is made.
     return (
         scenario.ambient_temp
         + 4.8 * c.radiation
@@ -54,29 +40,28 @@ def _cell_baseline_temp(scenario: Scenario, idx: int) -> float:
     )
 
 
-def baseline_layers(scenario: Scenario) -> dict[str, list[list[float]]]:
-    w, h = scenario.width, scenario.height
-    temperature = _blank(w, h)
-    radiation = _blank(w, h)
-    storage = _blank(w, h)
-    et_deficit = _blank(w, h)
-    ventilation = _blank(w, h)
-    activity = _blank(w, h)
-    for c in scenario.cells:
-        temperature[c.y][c.x] = _cell_baseline_temp(scenario, _index(c.x, c.y, w))
-        radiation[c.y][c.x] = c.radiation
-        storage[c.y][c.x] = c.storage
-        et_deficit[c.y][c.x] = c.et_deficit
-        ventilation[c.y][c.x] = c.ventilation
-        activity[c.y][c.x] = c.activity
-    return {
-        "temperature": temperature,
-        "radiation": radiation,
-        "storage": storage,
-        "et_deficit": et_deficit,
-        "ventilation": ventilation,
-        "activity": activity,
+def _base_arrays(scenario: Scenario) -> dict[str, np.ndarray]:
+    h, w = scenario.height, scenario.width
+    arrays = {
+        "temperature": np.zeros((h, w), dtype=np.float64),
+        "radiation": np.zeros((h, w), dtype=np.float64),
+        "storage": np.zeros((h, w), dtype=np.float64),
+        "et_deficit": np.zeros((h, w), dtype=np.float64),
+        "ventilation": np.zeros((h, w), dtype=np.float64),
+        "activity": np.zeros((h, w), dtype=np.float64),
     }
+    for c in scenario.cells:
+        arrays["temperature"][c.y, c.x] = _cell_baseline_temp(scenario, _index(c.x, c.y, w))
+        arrays["radiation"][c.y, c.x] = c.radiation
+        arrays["storage"][c.y, c.x] = c.storage
+        arrays["et_deficit"][c.y, c.x] = c.et_deficit
+        arrays["ventilation"][c.y, c.x] = c.ventilation
+        arrays["activity"][c.y, c.x] = c.activity
+    return arrays
+
+
+def baseline_layers(scenario: Scenario) -> dict[str, list[list[float]]]:
+    return {key: value.tolist() for key, value in _base_arrays(scenario).items()}
 
 
 def _validate_intervention(scenario: Scenario, item: dict) -> tuple[bool, str | None]:
@@ -92,34 +77,44 @@ def _validate_intervention(scenario: Scenario, item: dict) -> tuple[bool, str | 
     return True, None
 
 
-def _exposure_grid(
-    scenario: Scenario,
-    temperature: list[list[float]],
-    humidity_delta: list[list[float]],
-) -> list[list[float]]:
-    w, h = scenario.width, scenario.height
-    out = _blank(w, h)
-    for c in scenario.cells:
-        # A normalized person-weighted heat-stress proxy. Activity is a proxy for
-        # exposed person-hours, not a population estimate.
-        heat_stress = max(0.0, temperature[c.y][c.x] - 35.0)
-        humidity_penalty = 1.0 + 0.28 * max(0.0, humidity_delta[c.y][c.x])
-        out[c.y][c.x] = heat_stress * (0.20 + 0.80 * c.activity) * humidity_penalty
-    return out
+def _diffuse(grid: np.ndarray) -> np.ndarray:
+    # One conservative nearest-neighbour smoothing step. Edge cells only use
+    # neighbours that actually exist, avoiding wrap-around artifacts.
+    h, w = grid.shape
+    total = np.zeros_like(grid)
+    count = np.zeros_like(grid)
+    total[1:, :] += grid[:-1, :]
+    count[1:, :] += 1
+    total[:-1, :] += grid[1:, :]
+    count[:-1, :] += 1
+    total[:, 1:] += grid[:, :-1]
+    count[:, 1:] += 1
+    total[:, :-1] += grid[:, 1:]
+    count[:, :-1] += 1
+    neighbour_mean = total / np.maximum(count, 1)
+    return 0.86 * grid + 0.14 * neighbour_mean
 
 
-def _mechanism_fingerprint(
-    layers: dict[str, list[list[float]]], x: int, y: int
-) -> dict[str, float | str]:
+def _exposure(scenario: Scenario, temperature: np.ndarray, humidity_delta: np.ndarray, activity: np.ndarray) -> np.ndarray:
+    heat_stress = np.maximum(0.0, temperature - 35.0)
+    humidity_penalty = 1.0 + 0.28 * np.maximum(0.0, humidity_delta)
+    return heat_stress * (0.20 + 0.80 * activity) * humidity_penalty
+
+
+def _mechanism_fingerprint(layers: dict[str, np.ndarray | list[list[float]]], x: int, y: int) -> dict[str, float | str]:
+    def at(name: str) -> float:
+        value = layers[name]
+        return float(value[y][x])
+
     components = {
-        "radiation": layers["radiation"][y][x],
-        "heat_storage": layers["storage"][y][x],
-        "et_deficit": layers["et_deficit"][y][x],
-        "ventilation_restriction": 1.0 - layers["ventilation"][y][x],
+        "radiation": at("radiation"),
+        "heat_storage": at("storage"),
+        "et_deficit": at("et_deficit"),
+        "ventilation_restriction": 1.0 - at("ventilation"),
     }
     dominant = sorted(components.items(), key=lambda p: p[1], reverse=True)[:2]
     return {
-        **{k: round(float(v), 4) for k, v in components.items()},
+        **{k: round(v, 4) for k, v in components.items()},
         "dominant": " + ".join(k.replace("_", " ").title() for k, _ in dominant),
     }
 
@@ -129,30 +124,38 @@ def simulate(
     interventions: Iterable[dict] | None = None,
     scenario_id: str = "demo-block-a",
 ) -> dict:
-    # `size` remains accepted for backwards compatibility with the initial API.
+    # `size` is retained for backwards compatibility with the first prototype.
     scenario = get_scenario(scenario_id)
-    interventions = list(interventions or [])
-    layers = baseline_layers(scenario)
-    w, h = scenario.width, scenario.height
+    raw_interventions = list(interventions or [])
+    base = _base_arrays(scenario)
+    h, w = scenario.height, scenario.width
+    yy, xx = np.mgrid[0:h, 0:w]
 
-    temp = [row[:] for row in layers["temperature"]]
-    radiation = [row[:] for row in layers["radiation"]]
-    storage = [row[:] for row in layers["storage"]]
-    et_deficit = [row[:] for row in layers["et_deficit"]]
-    ventilation = [row[:] for row in layers["ventilation"]]
-    humidity_delta = _blank(w, h)
+    temperature = base["temperature"].copy()
+    radiation = base["radiation"].copy()
+    storage = base["storage"].copy()
+    et_deficit = base["et_deficit"].copy()
+    ventilation = base["ventilation"].copy()
+    activity = base["activity"]
+    humidity_delta = np.zeros((h, w), dtype=np.float64)
 
     total_cost = 0.0
     total_water = 0.0
     warnings: list[str] = []
     accepted: list[dict] = []
+    occupied: set[tuple[int, int]] = set()
 
-    for raw in interventions:
+    for raw in raw_interventions:
         item = {"type": raw["type"], "x": int(raw["x"]), "y": int(raw["y"])}
         ok, warning = _validate_intervention(scenario, item)
         if not ok:
             warnings.append(warning or "Invalid intervention")
             continue
+        cell_key = (item["x"], item["y"])
+        if cell_key in occupied:
+            warnings.append(f"Cell ({item['x']},{item['y']}) already contains an intervention")
+            continue
+        occupied.add(cell_key)
 
         kind = item["type"]
         p = PARAMS[kind]
@@ -161,77 +164,65 @@ def simulate(
         accepted.append(item)
         source = scenario.cells[_index(item["x"], item["y"], w)]
 
-        for y in range(h):
-            for x in range(w):
-                d = math.hypot(x - item["x"], y - item["y"])
-                influence = _kernel(d, p["radius"])
+        distance = np.hypot(xx - item["x"], yy - item["y"])
+        influence = np.exp(-np.square(distance / max(float(p["radius"]), 0.01)))
 
-                if kind in ("tree", "green"):
-                    shade = p["shade"] * influence
-                    et = p["et"] * influence
-                    radiation[y][x] = max(0.05, radiation[y][x] - shade)
-                    et_deficit[y][x] = max(0.02, et_deficit[y][x] - et)
-                    temp[y][x] -= 2.15 * shade + 1.55 * et
+        if kind in ("tree", "green"):
+            shade = float(p["shade"]) * influence
+            et = float(p["et"]) * influence
+            radiation = np.maximum(0.05, radiation - shade)
+            et_deficit = np.maximum(0.02, et_deficit - et)
+            temperature -= 2.15 * shade + 1.55 * et
 
-                    # Dense planting in a high-flow corridor can create an airflow
-                    # penalty. The penalty is strongest directly downwind (east).
-                    if source.ventilation > 0.68 and x >= item["x"]:
-                        wake = influence * max(0.0, 1.0 - abs(y - item["y"]) / 3.0)
-                        ventilation[y][x] = max(0.05, ventilation[y][x] - 0.07 * wake)
-                        temp[y][x] += 0.28 * wake
+            if source.ventilation > 0.68:
+                downwind = (xx >= item["x"]).astype(np.float64)
+                lateral = np.maximum(0.0, 1.0 - np.abs(yy - item["y"]) / 3.0)
+                wake = influence * downwind * lateral
+                ventilation = np.maximum(0.05, ventilation - 0.07 * wake)
+                temperature += 0.28 * wake
 
-                elif kind == "water":
-                    evap = p["evap"] * influence
-                    temp[y][x] -= 1.95 * evap
-                    humidity_delta[y][x] += p["humidity"] * influence
-                    et_deficit[y][x] = max(0.02, et_deficit[y][x] - 0.22 * influence)
+        elif kind == "water":
+            evap = float(p["evap"]) * influence
+            temperature -= 1.95 * evap
+            humidity_delta += float(p["humidity"]) * influence
+            et_deficit = np.maximum(0.02, et_deficit - 0.22 * influence)
 
-                elif kind == "roof":
-                    if d <= 1.6:
-                        gain = p["albedo_gain"] * influence
-                        radiation[y][x] = max(0.04, radiation[y][x] - 0.62 * gain)
-                        storage[y][x] = max(0.05, storage[y][x] - 0.40 * gain)
-                        temp[y][x] -= 2.65 * gain
+        elif kind == "roof":
+            local = (distance <= 1.6).astype(np.float64)
+            gain = float(p["albedo_gain"]) * influence * local
+            radiation = np.maximum(0.04, radiation - 0.62 * gain)
+            storage = np.maximum(0.05, storage - 0.40 * gain)
+            temperature -= 2.65 * gain
 
-                elif kind == "pavement":
-                    gain = p["albedo_gain"] * influence
-                    radiation[y][x] = max(0.04, radiation[y][x] - 0.38 * gain)
-                    storage[y][x] = max(0.05, storage[y][x] - 0.31 * gain)
-                    temp[y][x] -= 1.65 * gain
+        elif kind == "pavement":
+            gain = float(p["albedo_gain"]) * influence
+            radiation = np.maximum(0.04, radiation - 0.38 * gain)
+            storage = np.maximum(0.05, storage - 0.31 * gain)
+            temperature -= 1.65 * gain
 
-    # Diffusive neighborhood term to avoid treating cells as independent islands.
-    diffused = [row[:] for row in temp]
-    for y in range(h):
-        for x in range(w):
-            neighbors = []
-            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                nx, ny = x + dx, y + dy
-                if 0 <= nx < w and 0 <= ny < h:
-                    neighbors.append(temp[ny][nx])
-            if neighbors:
-                diffused[y][x] = 0.86 * temp[y][x] + 0.14 * (sum(neighbors) / len(neighbors))
-    temp = diffused
+    # Apply the same diffusion operator to both reference and intervention states
+    # so a zero-intervention run is exactly a 0% reduction baseline.
+    baseline_temperature = _diffuse(base["temperature"])
+    temperature = _diffuse(temperature)
+    baseline_exposure = _exposure(scenario, baseline_temperature, np.zeros((h, w)), activity)
+    exposure = _exposure(scenario, temperature, humidity_delta, activity)
 
-    current_layers = {
-        "temperature": temp,
+    baseline_exposure_value = float(baseline_exposure.sum())
+    exposure_value = float(exposure.sum())
+    exposure_reduction = 0.0 if baseline_exposure_value == 0 else 100.0 * (baseline_exposure_value - exposure_value) / baseline_exposure_value
+
+    current_layers_np = {
+        "temperature": temperature,
         "radiation": radiation,
         "storage": storage,
         "et_deficit": et_deficit,
         "ventilation": ventilation,
-        "activity": layers["activity"],
+        "activity": activity,
+        "exposure": exposure,
     }
-    exposure = _exposure_grid(scenario, temp, humidity_delta)
-    current_layers["exposure"] = exposure
-
-    baseline_exposure = _exposure_grid(scenario, layers["temperature"], _blank(w, h))
-    base_exposure_value = sum(_flatten(baseline_exposure))
-    exposure_value = sum(_flatten(exposure))
-    exposure_reduction = 0.0 if base_exposure_value == 0 else 100.0 * (base_exposure_value - exposure_value) / base_exposure_value
-
-    temps = _flatten(temp)
     metrics = {
-        "avg_surface_temperature": round(sum(temps) / len(temps), 3),
-        "peak_surface_temperature": round(max(temps), 3),
+        "avg_surface_temperature": round(float(temperature.mean()), 3),
+        "peak_surface_temperature": round(float(temperature.max()), 3),
         "exposure_index": round(exposure_value, 3),
         "exposure_reduction_pct": round(exposure_reduction, 3),
         "cost": round(total_cost, 2),
@@ -241,15 +232,17 @@ def simulate(
 
     explanations = []
     for item in accepted:
-        fp = _mechanism_fingerprint(current_layers, item["x"], item["y"])
+        fp = _mechanism_fingerprint(current_layers_np, item["x"], item["y"])
+        land = scenario.cells[_index(item["x"], item["y"], w)].land
         explanations.append(
             {
                 **item,
                 "fingerprint": fp,
-                "reason": f"Targets {fp['dominant']} at a valid {scenario.cells[_index(item['x'], item['y'], w)].land} cell.",
+                "reason": f"Targets {fp['dominant']} at a valid {land} cell.",
             }
         )
 
+    layers = {key: value.tolist() for key, value in current_layers_np.items()}
     return {
         "scenario": {
             "id": scenario.id,
@@ -262,9 +255,9 @@ def simulate(
             "wind_direction_deg": scenario.wind_direction_deg,
         },
         "interventions": accepted,
-        "layers": current_layers,
-        "temperature_grid": temp,
-        "exposure_grid": exposure,
+        "layers": layers,
+        "temperature_grid": layers["temperature"],
+        "exposure_grid": layers["exposure"],
         "metrics": metrics,
         "warnings": warnings,
         "explanations": explanations,
@@ -275,5 +268,4 @@ def fingerprint(x: int, y: int, scenario_id: str = "demo-block-a") -> dict:
     scenario = get_scenario(scenario_id)
     if not (0 <= x < scenario.width and 0 <= y < scenario.height):
         raise ValueError("Cell outside scenario bounds")
-    layers = baseline_layers(scenario)
-    return _mechanism_fingerprint(layers, x, y)
+    return _mechanism_fingerprint(_base_arrays(scenario), x, y)
