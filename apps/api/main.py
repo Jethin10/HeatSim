@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from optimizer.search import optimize
 from simulation.scenario import get_scenario
-from simulation.simulator import PARAMS, fingerprint, simulate
+from simulation.simulator import PARAMS, VALID_LAND, fingerprint, simulate
 
 
 app = FastAPI(
@@ -62,7 +62,7 @@ def interventions_catalog():
         kind: {
             "cost": p["cost"],
             "water_per_day": p["water"],
-            "valid_land": sorted(list(__import__("simulation.simulator", fromlist=["VALID_LAND"]).VALID_LAND[kind])),
+            "valid_land": sorted(VALID_LAND[kind]),
         }
         for kind, p in PARAMS.items()
     }
