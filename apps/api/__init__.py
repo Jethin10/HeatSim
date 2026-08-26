@@ -1,0 +1,1 @@
+"""HeatRx FastAPI application package."""

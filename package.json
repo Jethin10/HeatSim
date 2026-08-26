@@ -1,0 +1,9 @@
+{
+  "name": "heatsim",
+  "private": true,
+  "scripts": {
+    "dev": "npm --workspace apps/web run dev",
+    "build": "npm --workspace apps/web run build"
+  },
+  "workspaces": ["apps/web"]
+}
